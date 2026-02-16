@@ -39,6 +39,10 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (or 'auto')")
     parser.add_argument("--checkpoint-repo", type=str, default=None,
                         help="HuggingFace repo for checkpoint backup (e.g. 'lpkphd/mosaic-gpt-checkpoints')")
+    parser.add_argument("--plateau-patience", type=int, default=10,
+                        help="Stop after N evals without improvement (default: 10)")
+    parser.add_argument("--plateau-min-delta", type=float, default=0.01,
+                        help="Minimum loss improvement to count as progress (default: 0.01)")
     args = parser.parse_args()
 
     cfg = MosaicConfig.from_yaml(args.config)
@@ -98,6 +102,8 @@ def main():
         grad_accum_steps=args.grad_accum,
         resume_from=resume_path,
         checkpoint_repo=args.checkpoint_repo if is_main else None,
+        plateau_patience=args.plateau_patience,
+        plateau_min_delta=args.plateau_min_delta,
     )
 
     if ddp:

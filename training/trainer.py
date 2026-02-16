@@ -105,6 +105,8 @@ def train(
     grad_accum_steps: int = 1,
     resume_from: str = None,
     checkpoint_repo: str = None,
+    plateau_patience: int = 10,
+    plateau_min_delta: float = 0.01,
 ):
     """Main training loop."""
     run_path = Path(run_dir)
@@ -124,6 +126,7 @@ def train(
     scaler = GradScaler(enabled=use_amp)
 
     best_val_loss = float("inf")
+    evals_without_improvement = 0
     step = 0
 
     # Resume from checkpoint
@@ -253,12 +256,20 @@ def train(
                 "step": step, "loss": metrics["loss"], "ppl": metrics["perplexity"],
             })
 
-            if metrics["loss"] < best_val_loss:
+            if metrics["loss"] < best_val_loss - plateau_min_delta:
                 best_val_loss = metrics["loss"]
+                evals_without_improvement = 0
                 save_checkpoint(model, optimizer, scaler, cfg, step, metrics, best_val_loss, run_path / "best.pt")
                 print(f"  New best! Saved to {run_path / 'best.pt'}")
                 if checkpoint_repo:
                     _upload_to_hf_async(run_path / "best.pt", checkpoint_repo, f"{run_path.name}/best.pt")
+            else:
+                evals_without_improvement += 1
+                print(f"  No improvement for {evals_without_improvement}/{plateau_patience} evals (best={best_val_loss:.4f})")
+                if evals_without_improvement >= plateau_patience:
+                    print(f"\n  PLATEAU DETECTED: No improvement for {plateau_patience} consecutive evals.")
+                    print(f"  Stopping early at step {step}. Best val loss: {best_val_loss:.4f}")
+                    break
 
         # Periodic save
         if step % cfg.training.save_interval == 0:
