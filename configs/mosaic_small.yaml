@@ -1,0 +1,57 @@
+# MOSAIC-GPT Small — Full SOTA stack at research-friendly scale
+# ~150M active params, ~400M total with MoE
+# Trains on a single RTX 3090 in ~12-24 hours
+
+d_model: 768
+n_layers: 12
+vocab_size: 50257  # GPT-2 tokenizer
+
+attention:
+  type: mla
+  n_heads: 12
+  kv_compression_dim: 256
+  q_compression_dim: 384
+  rope_dim: 64
+  dropout: 0.0
+
+ffn:
+  type: moe_swiglu
+  hidden_mult: 2.6667  # 8/3
+  n_experts: 8
+  top_k: 2
+  shared_experts: 1
+  load_balance_weight: 0.01
+  dropout: 0.0
+
+position:
+  type: decoupled_rope
+  max_seq_len: 2048
+  rope_base: 10000.0
+
+norm:
+  type: rmsnorm
+  eps: 1.0e-6
+
+output:
+  type: tied
+
+embed_dropout: 0.0
+residual_dropout: 0.0
+
+training:
+  batch_size: 32
+  seq_len: 1024
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 1000
+  max_steps: 50000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  dataset: HuggingFaceFW/fineweb-edu
+  tokenizer: gpt2
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 2500
+  eval_steps: 100
