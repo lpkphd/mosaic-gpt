@@ -24,8 +24,8 @@ from mosaic.config import MosaicConfig
 from mosaic.model import MosaicGPT
 
 
-def _upload_checkpoint_async(local_path, repo_id, remote_path):
-    """Upload checkpoint to HuggingFace Hub in a background thread."""
+def _upload_to_hf_async(local_path, repo_id, remote_path):
+    """Upload a file to HuggingFace Hub in a background thread."""
     def _upload():
         try:
             from huggingface_hub import HfApi
@@ -38,10 +38,20 @@ def _upload_checkpoint_async(local_path, repo_id, remote_path):
             )
             print(f"  Backed up {remote_path} to hf://{repo_id}")
         except Exception as e:
-            print(f"  Warning: checkpoint backup failed: {e}")
+            print(f"  Warning: backup failed for {remote_path}: {e}")
     thread = threading.Thread(target=_upload, daemon=True)
     thread.start()
     return thread
+
+
+def _save_training_log(run_path, checkpoint_repo, step, metrics_history):
+    """Save training metrics as JSON for easy plotting later."""
+    import json
+    log_path = run_path / "metrics.json"
+    with open(log_path, "w") as f:
+        json.dump(metrics_history, f, indent=2)
+    if checkpoint_repo:
+        _upload_to_hf_async(log_path, checkpoint_repo, f"{run_path.name}/metrics.json")
 
 
 def get_lr(step: int, cfg: MosaicConfig) -> float:
@@ -147,6 +157,7 @@ def train(
     train_iter = iter(train_loader)
     t0 = time.time()
     tokens_processed = 0
+    metrics_history = {"train": [], "eval": []}
 
     print(f"\nTraining MOSAIC-GPT")
     print(model.summary())
@@ -210,6 +221,11 @@ def train(
                 msg += f" | aux {accum_aux:.4f}"
             print(msg)
 
+            metrics_history["train"].append({
+                "step": step, "loss": accum_loss, "ppl": ppl,
+                "lr": lr, "grad_norm": float(grad_norm), "tok_s": tok_per_sec,
+            })
+
             if use_wandb:
                 import wandb
                 wandb.log({
@@ -233,35 +249,50 @@ def train(
                     "eval/ppl": metrics["perplexity"],
                 }, step=step)
 
+            metrics_history["eval"].append({
+                "step": step, "loss": metrics["loss"], "ppl": metrics["perplexity"],
+            })
+
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
                 save_checkpoint(model, optimizer, scaler, cfg, step, metrics, best_val_loss, run_path / "best.pt")
                 print(f"  New best! Saved to {run_path / 'best.pt'}")
                 if checkpoint_repo:
-                    _upload_checkpoint_async(run_path / "best.pt", checkpoint_repo, f"{run_path.name}/best.pt")
+                    _upload_to_hf_async(run_path / "best.pt", checkpoint_repo, f"{run_path.name}/best.pt")
 
         # Periodic save
         if step % cfg.training.save_interval == 0:
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / f"step_{step}.pt")
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+            _save_training_log(run_path, checkpoint_repo, step, metrics_history)
             if checkpoint_repo:
                 run_name = run_path.name
-                _upload_checkpoint_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
-                _upload_checkpoint_async(run_path / f"step_{step}.pt", checkpoint_repo, f"{run_name}/step_{step}.pt")
+                _upload_to_hf_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
+                _upload_to_hf_async(run_path / f"step_{step}.pt", checkpoint_repo, f"{run_name}/step_{step}.pt")
+                # Also back up the config
+                cfg_path = run_path / "config.yaml"
+                if cfg_path.exists():
+                    _upload_to_hf_async(cfg_path, checkpoint_repo, f"{run_name}/config.yaml")
 
         # Auto-save latest every 250 steps (crash recovery)
         elif step % 250 == 0:
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
             if checkpoint_repo:
                 run_name = run_path.name
-                _upload_checkpoint_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
+                _upload_to_hf_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
 
     # Final save
     save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "final.pt")
+    _save_training_log(run_path, None, step, metrics_history)  # Save locally
     if checkpoint_repo:
         run_name = run_path.name
-        t = _upload_checkpoint_async(run_path / "final.pt", checkpoint_repo, f"{run_name}/final.pt")
-        t.join()  # Wait for final upload to complete before exiting
+        _upload_to_hf_async(run_path / "final.pt", checkpoint_repo, f"{run_name}/final.pt")
+        _upload_to_hf_async(run_path / "best.pt", checkpoint_repo, f"{run_name}/best.pt")
+        cfg_path = run_path / "config.yaml"
+        if cfg_path.exists():
+            _upload_to_hf_async(cfg_path, checkpoint_repo, f"{run_name}/config.yaml")
+        t = _upload_to_hf_async(run_path / "metrics.json", checkpoint_repo, f"{run_name}/metrics.json")
+        t.join()  # Wait for final uploads before exiting
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
 
     if use_wandb:
