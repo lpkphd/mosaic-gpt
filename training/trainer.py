@@ -15,7 +15,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 
 from mosaic.config import MosaicConfig
