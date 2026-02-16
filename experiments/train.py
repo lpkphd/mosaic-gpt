@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--workers", type=int, default=2, help="Data loader workers")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (or 'auto')")
+    parser.add_argument("--checkpoint-repo", type=str, default=None,
+                        help="HuggingFace repo for checkpoint backup (e.g. 'lpkphd/mosaic-gpt-checkpoints')")
     args = parser.parse_args()
 
     cfg = MosaicConfig.from_yaml(args.config)
@@ -95,6 +97,7 @@ def main():
         use_wandb=args.wandb and is_main,
         grad_accum_steps=args.grad_accum,
         resume_from=resume_path,
+        checkpoint_repo=args.checkpoint_repo if is_main else None,
     )
 
     if ddp:

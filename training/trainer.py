@@ -7,11 +7,13 @@ Handles:
 - MoE auxiliary loss
 - Periodic evaluation and checkpointing
 - Wandb logging (optional)
+- Checkpoint backup to HuggingFace Hub (for spot instance safety)
 """
 
 import os
 import math
 import time
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,26 @@ from pathlib import Path
 
 from mosaic.config import MosaicConfig
 from mosaic.model import MosaicGPT
+
+
+def _upload_checkpoint_async(local_path, repo_id, remote_path):
+    """Upload checkpoint to HuggingFace Hub in a background thread."""
+    def _upload():
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=remote_path,
+                repo_id=repo_id,
+                repo_type="model",
+            )
+            print(f"  Backed up {remote_path} to hf://{repo_id}")
+        except Exception as e:
+            print(f"  Warning: checkpoint backup failed: {e}")
+    thread = threading.Thread(target=_upload, daemon=True)
+    thread.start()
+    return thread
 
 
 def get_lr(step: int, cfg: MosaicConfig) -> float:
@@ -72,6 +94,7 @@ def train(
     use_wandb: bool = False,
     grad_accum_steps: int = 1,
     resume_from: str = None,
+    checkpoint_repo: str = None,
 ):
     """Main training loop."""
     run_path = Path(run_dir)
@@ -95,11 +118,24 @@ def train(
 
     # Resume from checkpoint
     if resume_from is None:
-        # Auto-resume: check for latest checkpoint in run_dir
         latest = run_path / "latest.pt"
         if latest.exists():
             resume_from = str(latest)
             print(f"Auto-resuming from {resume_from}")
+        elif checkpoint_repo:
+            # Try downloading latest checkpoint from HuggingFace
+            try:
+                from huggingface_hub import hf_hub_download
+                run_name = run_path.name
+                dl_path = hf_hub_download(
+                    repo_id=checkpoint_repo,
+                    filename=f"{run_name}/latest.pt",
+                    repo_type="model",
+                )
+                resume_from = dl_path
+                print(f"Downloaded checkpoint from hf://{checkpoint_repo}/{run_name}/latest.pt")
+            except Exception:
+                print("No remote checkpoint found, starting fresh.")
 
     if resume_from is not None and os.path.exists(resume_from):
         step, best_val_loss = load_checkpoint(resume_from, model, optimizer, scaler, device)
@@ -201,18 +237,31 @@ def train(
                 best_val_loss = metrics["loss"]
                 save_checkpoint(model, optimizer, scaler, cfg, step, metrics, best_val_loss, run_path / "best.pt")
                 print(f"  New best! Saved to {run_path / 'best.pt'}")
+                if checkpoint_repo:
+                    _upload_checkpoint_async(run_path / "best.pt", checkpoint_repo, f"{run_path.name}/best.pt")
 
         # Periodic save
         if step % cfg.training.save_interval == 0:
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / f"step_{step}.pt")
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+            if checkpoint_repo:
+                run_name = run_path.name
+                _upload_checkpoint_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
+                _upload_checkpoint_async(run_path / f"step_{step}.pt", checkpoint_repo, f"{run_name}/step_{step}.pt")
 
         # Auto-save latest every 250 steps (crash recovery)
         elif step % 250 == 0:
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+            if checkpoint_repo:
+                run_name = run_path.name
+                _upload_checkpoint_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
 
     # Final save
     save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "final.pt")
+    if checkpoint_repo:
+        run_name = run_path.name
+        t = _upload_checkpoint_async(run_path / "final.pt", checkpoint_repo, f"{run_name}/final.pt")
+        t.join()  # Wait for final upload to complete before exiting
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
 
     if use_wandb:
