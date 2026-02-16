@@ -1,0 +1,48 @@
+d_model: 768
+n_layers: 12
+vocab_size: 50257
+attention:
+  type: mla
+  n_heads: 12
+  n_kv_heads: null
+  kv_compression_dim: 256
+  q_compression_dim: 384
+  rope_dim: 64
+  dropout: 0.0
+ffn:
+  type: moe_swiglu
+  hidden_mult: 2.6667
+  n_experts: 4
+  top_k: 2
+  shared_experts: 1
+  load_balance_weight: 0.01
+  dropout: 0.0
+position:
+  type: decoupled_rope
+  max_seq_len: 2048
+  rope_base: 10000.0
+  rope_dim: null
+norm:
+  type: rmsnorm
+  eps: 1.0e-06
+output:
+  type: tied
+training:
+  batch_size: 4
+  seq_len: 1024
+  lr: 0.0003
+  min_lr: 3.0e-05
+  warmup_steps: 1000
+  max_steps: 50000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  beta1: 0.9
+  beta2: 0.95
+  dataset: HuggingFaceFW/fineweb-edu
+  tokenizer: gpt2
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 2500
+  eval_steps: 100
+embed_dropout: 0.0
+residual_dropout: 0.0
