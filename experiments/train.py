@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None, help="Override max training steps")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--workers", type=int, default=2, help="Data loader workers")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (or 'auto')")
     args = parser.parse_args()
 
     cfg = MosaicConfig.from_yaml(args.config)
@@ -80,6 +81,10 @@ def main():
     train_loader = build_train_loader(cfg, num_workers=args.workers)
     eval_loader = build_eval_loader(cfg)
 
+    resume_path = args.resume
+    if resume_path == "auto":
+        resume_path = None  # trainer auto-detects latest.pt
+
     train(
         model=raw_model,
         cfg=cfg,
@@ -89,6 +94,7 @@ def main():
         run_dir=run_dir if is_main else "/tmp/mosaic_worker",
         use_wandb=args.wandb and is_main,
         grad_accum_steps=args.grad_accum,
+        resume_from=resume_path,
     )
 
     if ddp:

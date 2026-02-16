@@ -71,6 +71,7 @@ def train(
     run_dir: str = "runs/mosaic",
     use_wandb: bool = False,
     grad_accum_steps: int = 1,
+    resume_from: str = None,
 ):
     """Main training loop."""
     run_path = Path(run_dir)
@@ -89,13 +90,25 @@ def train(
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
 
+    best_val_loss = float("inf")
+    step = 0
+
+    # Resume from checkpoint
+    if resume_from is None:
+        # Auto-resume: check for latest checkpoint in run_dir
+        latest = run_path / "latest.pt"
+        if latest.exists():
+            resume_from = str(latest)
+            print(f"Auto-resuming from {resume_from}")
+
+    if resume_from is not None and os.path.exists(resume_from):
+        step, best_val_loss = load_checkpoint(resume_from, model, optimizer, scaler, device)
+
     if use_wandb:
         import wandb
         wandb.init(project="mosaic-gpt", config=vars(cfg))
 
     train_iter = iter(train_loader)
-    best_val_loss = float("inf")
-    step = 0
     t0 = time.time()
     tokens_processed = 0
 
@@ -104,7 +117,10 @@ def train(
     print(f"Device: {device}")
     print(f"Grad accumulation: {grad_accum_steps}")
     print(f"Effective batch size: {cfg.training.batch_size * grad_accum_steps}")
-    print(f"Max steps: {cfg.training.max_steps}\n")
+    print(f"Max steps: {cfg.training.max_steps}")
+    if step > 0:
+        print(f"Resuming from step: {step}")
+    print()
 
     while step < cfg.training.max_steps:
         optimizer.zero_grad(set_to_none=True)
@@ -183,15 +199,20 @@ def train(
 
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
-                save_checkpoint(model, optimizer, cfg, step, metrics, run_path / "best.pt")
+                save_checkpoint(model, optimizer, scaler, cfg, step, metrics, best_val_loss, run_path / "best.pt")
                 print(f"  New best! Saved to {run_path / 'best.pt'}")
 
         # Periodic save
         if step % cfg.training.save_interval == 0:
-            save_checkpoint(model, optimizer, cfg, step, {}, run_path / f"step_{step}.pt")
+            save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / f"step_{step}.pt")
+            save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+
+        # Auto-save latest every 250 steps (crash recovery)
+        elif step % 250 == 0:
+            save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
 
     # Final save
-    save_checkpoint(model, optimizer, cfg, step, {}, run_path / "final.pt")
+    save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "final.pt")
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
 
     if use_wandb:
@@ -201,11 +222,25 @@ def train(
     return best_val_loss
 
 
-def save_checkpoint(model, optimizer, cfg, step, metrics, path):
+def save_checkpoint(model, optimizer, scaler, cfg, step, metrics, best_val_loss, path):
     torch.save({
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict(),
         "step": step,
         "config": cfg,
         "metrics": metrics,
+        "best_val_loss": best_val_loss,
     }, path)
+
+
+def load_checkpoint(path, model, optimizer, scaler, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    if "scaler_state" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state"])
+    step = ckpt["step"]
+    best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    print(f"Resumed from checkpoint at step {step} (best val loss: {best_val_loss:.4f})")
+    return step, best_val_loss
