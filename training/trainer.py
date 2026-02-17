@@ -8,10 +8,16 @@ Handles:
 - Periodic evaluation and checkpointing
 - Wandb logging (optional)
 - Checkpoint backup to HuggingFace Hub (for spot instance safety)
+- Heartbeat file for external monitoring
+- Auto disk cleanup (keeps only 2 most recent step_*.pt)
+- Graceful SIGTERM handling for spot instance preemption
 """
 
 import os
+import glob
+import json
 import math
+import signal
 import time
 import threading
 import torch
@@ -22,6 +28,110 @@ from pathlib import Path
 
 from mosaic.config import MosaicConfig
 from mosaic.model import MosaicGPT
+
+
+_shutdown_requested = False
+
+
+def _sigterm_handler(signum, frame):
+    global _shutdown_requested
+    _shutdown_requested = True
+    print("\n[SIGTERM] Graceful shutdown requested. Will save checkpoint after current step.")
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
+def _cleanup_old_checkpoints(run_path, keep=2):
+    """Delete all but the most recent `keep` step_*.pt files."""
+    step_files = sorted(
+        glob.glob(str(run_path / "step_*.pt")),
+        key=os.path.getmtime,
+    )
+    for old in step_files[:-keep] if len(step_files) > keep else []:
+        try:
+            os.remove(old)
+            print(f"  Cleaned up old checkpoint: {os.path.basename(old)}")
+        except OSError:
+            pass
+
+
+def _check_disk_usage(path="/workspace"):
+    """Return disk usage percentage for the given path."""
+    try:
+        stat = os.statvfs(path)
+        used = (stat.f_blocks - stat.f_bfree) / stat.f_blocks * 100
+        return used
+    except OSError:
+        return 0.0
+
+
+class HeartbeatWriter:
+    """Background thread that writes heartbeat.json every interval seconds."""
+
+    def __init__(self, run_path, model_name, max_steps, interval=30):
+        self.run_path = Path(run_path)
+        self.model_name = model_name
+        self.max_steps = max_steps
+        self.interval = interval
+        self.step = 0
+        self.loss = 0.0
+        self.ppl = 0.0
+        self.tok_s = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def update(self, step, loss, ppl, tok_s):
+        self.step = step
+        self.loss = loss
+        self.ppl = ppl
+        self.tok_s = tok_s
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self._write()
+        self._write()  # final write on stop
+
+    def _write(self):
+        try:
+            gpu_util = 0
+            disk_pct = _check_disk_usage()
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    utils = [int(x.strip()) for x in result.stdout.strip().split("\n") if x.strip()]
+                    gpu_util = max(utils) if utils else 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            heartbeat = {
+                "step": self.step,
+                "loss": round(self.loss, 4),
+                "ppl": round(self.ppl, 1),
+                "tok_s": round(self.tok_s, 0),
+                "gpu_util": gpu_util,
+                "disk_pct": round(disk_pct, 1),
+                "ts": int(time.time()),
+                "pid": os.getpid(),
+                "max_steps": self.max_steps,
+                "model": self.model_name,
+            }
+            path = self.run_path / "heartbeat.json"
+            with open(path, "w") as f:
+                json.dump(heartbeat, f)
+        except Exception:
+            pass
 
 
 def _upload_to_hf_async(local_path, repo_id, remote_path):
@@ -152,6 +262,12 @@ def train(
 
     if resume_from is not None and os.path.exists(resume_from):
         step, best_val_loss = load_checkpoint(resume_from, model, optimizer, scaler, device)
+        print(f"[HEARTBEAT] RESUMED step={step} max={cfg.training.max_steps} checkpoint={resume_from}")
+
+    # Start heartbeat writer
+    model_name = run_path.name
+    heartbeat = HeartbeatWriter(run_path, model_name, cfg.training.max_steps)
+    heartbeat.start()
 
     if use_wandb:
         import wandb
@@ -224,6 +340,8 @@ def train(
                 msg += f" | aux {accum_aux:.4f}"
             print(msg)
 
+            heartbeat.update(step, accum_loss, ppl, tok_per_sec)
+
             metrics_history["train"].append({
                 "step": step, "loss": accum_loss, "ppl": ppl,
                 "lr": lr, "grad_norm": float(grad_norm), "tok_s": tok_per_sec,
@@ -273,14 +391,31 @@ def train(
 
         # Periodic save
         if step % cfg.training.save_interval == 0:
+            # Pre-save disk check
+            disk_usage = _check_disk_usage()
+            if disk_usage > 80:
+                print(f"  Disk at {disk_usage:.0f}% — cleaning before save")
+                _cleanup_old_checkpoints(run_path, keep=1)
+                import shutil
+                for d in glob.glob("/tmp/hf_cache/models--*"):
+                    try:
+                        shutil.rmtree(d)
+                    except OSError:
+                        pass
+                for d in glob.glob("/root/.cache/huggingface/xet/*"):
+                    try:
+                        shutil.rmtree(d)
+                    except OSError:
+                        pass
+
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / f"step_{step}.pt")
             save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+            _cleanup_old_checkpoints(run_path, keep=2)
             _save_training_log(run_path, checkpoint_repo, step, metrics_history)
             if checkpoint_repo:
                 run_name = run_path.name
                 _upload_to_hf_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
                 _upload_to_hf_async(run_path / f"step_{step}.pt", checkpoint_repo, f"{run_name}/step_{step}.pt")
-                # Also back up the config
                 cfg_path = run_path / "config.yaml"
                 if cfg_path.exists():
                     _upload_to_hf_async(cfg_path, checkpoint_repo, f"{run_name}/config.yaml")
@@ -292,7 +427,20 @@ def train(
                 run_name = run_path.name
                 _upload_to_hf_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
 
+        # Graceful SIGTERM shutdown
+        if _shutdown_requested:
+            print(f"\n[SIGTERM] Saving checkpoint at step {step} and exiting...")
+            save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "latest.pt")
+            if checkpoint_repo:
+                run_name = run_path.name
+                t = _upload_to_hf_async(run_path / "latest.pt", checkpoint_repo, f"{run_name}/latest.pt")
+                t.join(timeout=60)
+            heartbeat.stop()
+            print(f"[SIGTERM] Checkpoint saved. Exiting gracefully.")
+            return best_val_loss
+
     # Final save
+    heartbeat.stop()
     save_checkpoint(model, optimizer, scaler, cfg, step, {}, best_val_loss, run_path / "final.pt")
     _save_training_log(run_path, None, step, metrics_history)  # Save locally
     if checkpoint_repo:

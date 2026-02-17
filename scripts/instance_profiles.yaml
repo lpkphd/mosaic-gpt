@@ -1,0 +1,57 @@
+gpt2_reference:
+  config: configs/gpt2_reference.yaml
+  run_dir: runs/gpt2_reference
+  checkpoint_size_gb: 1.5
+  hf_path: gpt2_reference
+  profiles:
+    RTX_4090_1x:
+      batch_size: 8
+      grad_accum: 32
+      nproc: 1
+    RTX_3090_4x:
+      batch_size: 8
+      grad_accum: 8
+      nproc: 4
+    RTX_4090_4x:
+      batch_size: 8
+      grad_accum: 8
+      nproc: 4
+    A100_SXM4_4x:
+      batch_size: 16
+      grad_accum: 4
+      nproc: 4
+
+mosaic_dense:
+  config: configs/mosaic_dense.yaml
+  run_dir: runs/mosaic_dense_3090
+  checkpoint_size_gb: 1.4
+  hf_path: mosaic_dense_3090
+  profiles:
+    A100_SXM4_4x:
+      batch_size: 8
+      grad_accum: 16
+      nproc: 4
+    RTX_3090_4x:
+      batch_size: 8
+      grad_accum: 16
+      nproc: 4
+
+mosaic_moe:
+  config: configs/mosaic_small_resume.yaml
+  run_dir: runs/mosaic_small_3090
+  checkpoint_size_gb: 4.2
+  hf_path: mosaic_small_3090
+  n_experts: 4  # CRITICAL: never use 8
+  profiles:
+    RTX_3090_8x:
+      batch_size: 4
+      grad_accum: 8
+      nproc: 8
+    RTX_3090_4x:
+      batch_size: 4
+      grad_accum: 16
+      nproc: 4
+    A100_SXM4_4x:
+      batch_size: 8
+      grad_accum: 8
+      nproc: 4

@@ -66,8 +66,19 @@ def main():
         is_main = True
 
     if is_main:
-        config_name = os.path.splitext(os.path.basename(args.config))[0]
-        run_dir = args.run_dir or f"runs/{config_name}"
+        if args.run_dir:
+            run_dir = args.run_dir
+            config_name = os.path.basename(run_dir)
+        elif args.config.startswith("configs/"):
+            config_name = os.path.splitext(os.path.basename(args.config))[0]
+            run_dir = f"runs/{config_name}"
+        else:
+            config_name = os.path.splitext(os.path.basename(args.config))[0]
+            if config_name == "config":
+                print(f"WARNING: --config path '{args.config}' resolves to name 'config'.")
+                print("Use --config configs/NAME.yaml --run-dir runs/DIR to avoid checkpoint misrouting.")
+                sys.exit(1)
+            run_dir = f"runs/{config_name}"
         os.makedirs(run_dir, exist_ok=True)
         cfg.to_yaml(os.path.join(run_dir, "config.yaml"))
 
